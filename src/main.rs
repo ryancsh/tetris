@@ -94,8 +94,10 @@ unsafe fn draw(hdc: HDC, rect: RECT) {
   let y = rect.top;
   let width = rect.right - rect.left;
   let height = rect.bottom - rect.top;
-  
-  let result = StretchDIBits(hdc, x, y, width, height, 0, 0, 2, 2, Some(image.as_ptr() as _), &header, DIB_RGB_COLORS, SRCCOPY);
+
+  // // // // // // //
+
+  let result = StretchDIBits(hdc, x, y, width, height, 0, 0, 2, 2, Some(_test_image.as_ptr() as _), &header, DIB_RGB_COLORS, SRCCOPY);
   assert!(result != 0);
 }
 
