@@ -5,6 +5,7 @@ use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Graphics::OpenGL::*;
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -19,6 +20,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 static SHOULD_RUN: AtomicBool = AtomicBool::new(true);
+static WINDOW_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
 static FRAMEBUFFERS: [FrameBuffer; 2] =
   [FrameBuffer::new(), FrameBuffer::new()];
@@ -49,7 +51,7 @@ impl FrameBuffer {
 }
 
 static FRONT_BUFFER_INDEX: AtomicUsize = AtomicUsize::new(0);
-static SWAP_BUFFERS: AtomicBool = AtomicBool::new(true);
+static SWAP_BUFFERS: AtomicBool = AtomicBool::new(false);
 fn front_buffer_index() -> usize {
   FRONT_BUFFER_INDEX.load(SeqCst)
 }
@@ -105,10 +107,11 @@ pub fn colorref_to_rgb(color: COLORREF) -> (u8, u8, u8) {
 static GAMESTATE: GameState = GameState::new();
 struct GameState {
   pub rgb: AtomicUsize,
+  pub x: AtomicUsize,
 }
 impl GameState {
   pub const fn new() -> Self {
-    Self { rgb: AtomicUsize::new(0) }
+    Self { rgb: AtomicUsize::new(0), x: AtomicUsize::new(0) }
   }
 }
 
@@ -119,13 +122,20 @@ fn update() {
   let b = ((rgb & 0x00_00FF) + 5) & 0xFF;
   let new_rgb = r | g | b;
   GAMESTATE.rgb.compare_exchange(rgb, new_rgb, SeqCst, SeqCst).unwrap();
+
+  let _ = GAMESTATE.x.fetch_add(1, SeqCst);
 }
 
 fn render() {
+  let ready = SWAP_BUFFERS.load(SeqCst);
+  if ready {
+    return;
+  }
+
   let rgb = GAMESTATE.rgb.load(SeqCst);
-  let r = (rgb & 0x00FF_0000) >> 16;
-  let g = (rgb & 0x0000_FF00) >> 8;
-  let b = rgb & 0x0000_00FF;
+  let r = (rgb >> 16) & 0xFF;
+  let g = (rgb >> 8) & 0xFF;
+  let b = rgb & 0xFF;
 
   let back_buffer = &FRAMEBUFFERS[back_buffer_index()];
 
@@ -133,10 +143,29 @@ fn render() {
   back_buffer.resize(win_width, win_height);
 
   let mut pixels = back_buffer.pixels.try_lock().unwrap();
-  let color = rgb_to_colorref(r as _, g as _, b as _);
-  for i in 0..back_buffer.buffer_len() {
-    pixels[i] = color;
+  let black = rgb_to_colorref(0, 0, 0);
+  for i in 0..win_width * win_height {
+    pixels[i] = black;
   }
+
+  let color = rgb_to_colorref(r as _, g as _, b as _);
+  for y in 1..win_height / 4 {
+    for x in 1..win_width / 4 {
+      pixels[y * win_width + x] = color;
+    }
+  }
+
+  let game_x = GAMESTATE.x.load(SeqCst);
+  pixels[((win_height * 3 / 4) * win_width) + game_x] =
+    rgb_to_colorref(0, 0, 0xFF);
+  pixels[((win_height * 3 / 4) * win_width) + game_x + 1] =
+    rgb_to_colorref(0, 0, 0xFF);
+  pixels[((win_height * 3 / 4) * win_width) + game_x + 2] =
+    rgb_to_colorref(0, 0xFF, 0);
+  pixels[((win_height * 3 / 4) * win_width) + game_x + 3] =
+    rgb_to_colorref(0xFF, 0, 0);
+
+  SWAP_BUFFERS.store(true, SeqCst);
 }
 
 fn main() -> Result<()> {
@@ -157,35 +186,89 @@ fn main() -> Result<()> {
     let atom = RegisterClassA(&window_class);
     assert!(atom != 0);
 
-    let window_handle = CreateWindowExA(
-      WINDOW_EX_STYLE::default(),
-      window_class_name,
-      window_name,
-      WS_OVERLAPPEDWINDOW, // | WS_DISABLED,    // window style
-      CW_USEDEFAULT,       // x
-      CW_USEDEFAULT,       // y
-      CW_USEDEFAULT,       // nWidth
-      CW_USEDEFAULT,       // nHeight
-      None,                // parent window handle
-      None,                // menu handle
-      instance_handle,     // instance
-      None,                // lpParam
-    );
-    assert!(window_handle.0 != 0);
+    {
+      // new block to limit scope of hwnd in case we recreate the window
+      // OpenGL requires WS_CLIPSIBLINGS and WS_CLIPCHILDREN
+      let hwnd = CreateWindowExA(
+        WINDOW_EX_STYLE::default(),
+        window_class_name,
+        window_name,
+        WS_OVERLAPPEDWINDOW | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+        CW_USEDEFAULT,   // x
+        CW_USEDEFAULT,   // y
+        CW_USEDEFAULT,   // nWidth
+        CW_USEDEFAULT,   // nHeight
+        None,            // parent window handle
+        None,            // menu handle
+        instance_handle, // instance
+        None,            // lpParam
+      );
+      assert!(hwnd.0 != 0);
+      WINDOW_HANDLE.store(hwnd.0, SeqCst);
 
-    let hdc = GetDC(window_handle);
-    assert!(hdc.0 != 0);
+      let hdc = GetDC(hwnd);
+      assert!(hdc.0 != 0);
 
-    let mut client_rect = RECT::default();
-    GetClientRect(window_handle, &mut client_rect).unwrap();
-    TARGET_WINDOW_SIZE.store(
-      (client_rect.right - client_rect.left) as _,
-      (client_rect.bottom - client_rect.top) as _,
-    );
+      // chose pixel format that supports OpenGL
+      // for better fit, enumerate all of them and pick best one
+      // instead of leaving it to Windows to choose
+      let mut format_desc = PIXELFORMATDESCRIPTOR::default();
+      format_desc.nSize = mem::size_of::<PIXELFORMATDESCRIPTOR>() as _;
+      format_desc.nVersion = 1;
+      format_desc.dwFlags =
+        PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+      format_desc.iPixelType = PFD_TYPE_RGBA;
+      format_desc.cColorBits = 32;
+      format_desc.cDepthBits = 16; // 16, 24 or 32?
+      format_desc.iLayerType = PFD_MAIN_PLANE.0 as _;
+      let format_id = ChoosePixelFormat(hdc, &format_desc);
+      assert!(format_id > 0);
 
-    // let _ = EnableWindow(window_handle, true);
-    let _ = ShowWindow(window_handle, SW_SHOW);
-    // assert!(ValidateRect(window_handle, None).0 != 0);
+      // verify that we got a good pixel format
+      let mut result_desc = PIXELFORMATDESCRIPTOR::default();
+      let _max_format_id = DescribePixelFormat(
+        hdc,
+        format_id,
+        mem::size_of::<PIXELFORMATDESCRIPTOR>() as _,
+        Some(&mut result_desc),
+      );
+      assert!(
+        (result_desc.dwFlags.0 & format_desc.dwFlags.0)
+          == format_desc.dwFlags.0
+      );
+      assert!(
+        (result_desc.iPixelType.0 & format_desc.iPixelType.0)
+          == format_desc.iPixelType.0
+      );
+      assert!(result_desc.cColorBits >= format_desc.cColorBits);
+      assert!(result_desc.cDepthBits >= format_desc.cDepthBits);
+      assert!(
+        result_desc.iLayerType == format_desc.iLayerType
+          || result_desc.iLayerType == 0
+      );
+
+      SetPixelFormat(hdc, format_id, &result_desc).unwrap();
+
+      // let hglrc = wglCreateContext(hdc).unwrap();
+      // assert!(hglrc.0 != 0);
+
+      let mut client_rect = RECT::default();
+      GetClientRect(hwnd, &mut client_rect).unwrap();
+      TARGET_WINDOW_SIZE.store(
+        (client_rect.right - client_rect.left) as _,
+        (client_rect.bottom - client_rect.top) as _,
+      );
+
+      // let _ = EnableWindow(hwnd, true);
+      let _ = ShowWindow(hwnd, SW_SHOW);
+      // assert!(ValidateRect(hwnd, None).0 != 0);
+
+      ReleaseDC(hwnd, hdc);
+    }
+
+    // draw before first update
+    render();
+    draw(true);
 
     let mut last_instant = Instant::now();
     let mut message = MSG::default();
@@ -196,16 +279,8 @@ fn main() -> Result<()> {
       }
 
       update(); // TODO: make this use dt
-
-      let ready = SWAP_BUFFERS.load(SeqCst);
-      if !ready {
-        render();
-
-        SWAP_BUFFERS.store(true, SeqCst);
-      }
-
-      draw(hdc);
-      DwmFlush().unwrap(); // wait for Vsync
+      render();
+      draw(true);
 
       // thread::sleep(Duration::from_millis(1));
       let now = Instant::now();
@@ -224,7 +299,19 @@ fn main() -> Result<()> {
   }
 }
 
-unsafe fn draw(hdc: HDC) {
+unsafe fn draw(wait_for_vsync: bool) {
+  let hwnd = HWND(WINDOW_HANDLE.load(SeqCst));
+  if hwnd.0 == 0 {
+    println!("Got NULL hwnd. Skipping call to draw()");
+    return;
+  }
+
+  let hdc = GetDC(hwnd);
+  if hdc.0 == 0 {
+    println!("Got NULL device context. Skipping call to draw()");
+    return;
+  }
+
   perform_buffer_swap();
 
   let buffer = &FRAMEBUFFERS[front_buffer_index()];
@@ -270,6 +357,13 @@ unsafe fn draw(hdc: HDC) {
     SRCCOPY,
   );
   assert!(result != 0);
+
+  SwapBuffers(hdc);
+  if wait_for_vsync {
+    DwmFlush().unwrap();
+  }
+
+  ReleaseDC(hwnd, hdc);
 }
 
 extern "system" fn window_proc(
@@ -282,7 +376,7 @@ extern "system" fn window_proc(
     if message == WM_PAINT {
       let mut paint = PAINTSTRUCT::default();
       BeginPaint(window, &mut paint);
-      draw(paint.hdc);
+      draw(false);
       let _ = EndPaint(window, &paint);
     } else if message == WM_CLOSE || message == WM_DESTROY {
       SHOULD_RUN.store(false, Ordering::SeqCst);
