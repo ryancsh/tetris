@@ -2,6 +2,7 @@
 #![allow(unused_variables)]
 
 use windows::core::*;
+
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -176,7 +177,7 @@ fn main() -> Result<()> {
     let window_name = s!("ZInvaders");
 
     let window_class = WNDCLASSA {
-      style: CS_HREDRAW | CS_VREDRAW, // & WNDCLASS_STYLES(0),
+      style: CS_HREDRAW | CS_VREDRAW | CS_OWNDC, // & WNDCLASS_STYLES(0),
       lpfnWndProc: Some(window_proc),
       hInstance: instance_handle.into(),
       lpszClassName: window_class_name,
@@ -206,6 +207,20 @@ fn main() -> Result<()> {
       assert!(hwnd.0 != 0);
       WINDOW_HANDLE.store(hwnd.0, SeqCst);
 
+      #[cfg(debug_assertions)]
+      {
+        SetWindowPos(
+          hwnd,
+          HWND(0),
+          100,
+          100,
+          400,
+          400,
+          SET_WINDOW_POS_FLAGS(0),
+        )
+        .unwrap();
+      }
+
       let hdc = GetDC(hwnd);
       assert!(hdc.0 != 0);
 
@@ -215,11 +230,11 @@ fn main() -> Result<()> {
       let mut format_desc = PIXELFORMATDESCRIPTOR::default();
       format_desc.nSize = mem::size_of::<PIXELFORMATDESCRIPTOR>() as _;
       format_desc.nVersion = 1;
-      format_desc.dwFlags =
-        PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+      format_desc.dwFlags = PFD_DRAW_TO_WINDOW; // | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
       format_desc.iPixelType = PFD_TYPE_RGBA;
       format_desc.cColorBits = 32;
       format_desc.cDepthBits = 16; // 16, 24 or 32?
+                                   // format_desc.cStencilBits = 8;  // for OpenGL
       format_desc.iLayerType = PFD_MAIN_PLANE.0 as _;
       let format_id = ChoosePixelFormat(hdc, &format_desc);
       assert!(format_id > 0);
@@ -249,8 +264,11 @@ fn main() -> Result<()> {
 
       SetPixelFormat(hdc, format_id, &result_desc).unwrap();
 
-      // let hglrc = wglCreateContext(hdc).unwrap();
-      // assert!(hglrc.0 != 0);
+      /*
+      let hglrc = wglCreateContext(hdc).unwrap();
+      assert!(hglrc.0 != 0);
+      wglMakeCurrent(hdc, hglrc).unwrap();
+      */
 
       let mut client_rect = RECT::default();
       GetClientRect(hwnd, &mut client_rect).unwrap();
@@ -275,7 +293,20 @@ fn main() -> Result<()> {
 
     while SHOULD_RUN.load(Ordering::SeqCst) {
       while PeekMessageA(&mut message, None, 0, 0, PM_REMOVE).into() {
-        DispatchMessageA(&message);
+        if message.message == WM_KEYDOWN
+          || message.message == WM_KEYUP
+          || message.message == WM_SYSKEYUP
+          || message.message == WM_SYSKEYDOWN
+        {
+          handle_keyboard_message(
+            message.hwnd,
+            message.message,
+            message.wParam,
+            message.lParam,
+          );
+        } else {
+          DispatchMessageA(&message);
+        }
       }
 
       update(); // TODO: make this use dt
@@ -283,15 +314,27 @@ fn main() -> Result<()> {
       draw(true);
 
       // thread::sleep(Duration::from_millis(1));
-      let now = Instant::now();
-      let frame_time = now.duration_since(last_instant);
-      println!(
-        "Frame {} ms, front: {}, back: {}",
-        frame_time.as_secs_f32() * 1000.0,
-        front_buffer_index(),
-        back_buffer_index(),
-      );
-      last_instant = now;
+      if false {
+        let now = Instant::now();
+        let frame_time = now.duration_since(last_instant);
+        println!(
+          "Frame {} ms, front: {}, back: {}",
+          frame_time.as_secs_f32() * 1000.0,
+          front_buffer_index(),
+          back_buffer_index(),
+        );
+        last_instant = now;
+      }
+    }
+
+    let hglrc = wglGetCurrentContext();
+    if hglrc.0 != 0 {
+      let hdc = wglGetCurrentDC();
+      assert!(hdc.0 != 0);
+      wglMakeCurrent(HDC(0), HGLRC(0)).unwrap();
+      let hwnd = WINDOW_HANDLE.load(SeqCst);
+      ReleaseDC(HWND(hwnd), hdc);
+      wglDeleteContext(hglrc).unwrap();
     }
 
     PostQuitMessage(0);
@@ -358,8 +401,8 @@ unsafe fn draw(wait_for_vsync: bool) {
   );
   assert!(result != 0);
 
-  SwapBuffers(hdc);
   if wait_for_vsync {
+    // SwapBuffers().unwrap();
     DwmFlush().unwrap();
   }
 
@@ -378,8 +421,16 @@ extern "system" fn window_proc(
       BeginPaint(window, &mut paint);
       draw(false);
       let _ = EndPaint(window, &paint);
+      return LRESULT(0);
+    } else if message == WM_KEYDOWN
+      || message == WM_KEYUP
+      || message == WM_SYSKEYDOWN
+      || message == WM_SYSKEYUP
+    {
+      panic!("Should have handled keyboard messages in main loop");
     } else if message == WM_CLOSE || message == WM_DESTROY {
       SHOULD_RUN.store(false, Ordering::SeqCst);
+      return LRESULT(0);
     } else if message == WM_ERASEBKGND {
       return LRESULT(1); // tell Windows we processed this
     } else if message == WM_QUIT {
@@ -388,9 +439,60 @@ extern "system" fn window_proc(
       let width = lparam.0 & 0xFFFF;
       let height = (lparam.0 >> 16) & 0xFFFF;
       TARGET_WINDOW_SIZE.store(width as _, height as _);
-    } else {
-      return DefWindowProcA(window, message, wparam, lparam);
+      return LRESULT(0);
     }
-    LRESULT(0)
+    DefWindowProcA(window, message, wparam, lparam)
+  }
+}
+
+fn handle_keyboard_message(
+  window: HWND,
+  message: u32,
+  wparam: WPARAM,
+  lparam: LPARAM,
+) {
+  assert!(
+    message == WM_KEYDOWN
+      || message == WM_KEYUP
+      || message == WM_SYSKEYDOWN
+      || message == WM_SYSKEYUP
+  );
+
+  let key_code = VIRTUAL_KEY(wparam.0.try_into().unwrap());
+
+  let lparam = lparam.0;
+  let repeat_count = lparam & 0xFFFF; // 16 bits (0 - 15)
+  let scan_code = (lparam >> 16) & 0xFF; // 8 bits (16 - 23)
+  let is_extended = ((lparam >> 24) & 1) != 0; // 1 bit (24)
+  let reserved = (lparam >> 25) & 0xF; // 4 bits (25 - 28)
+  let context_code = (lparam >> 29) & 1; // 1 bit (29)
+  let key_was_down = ((lparam >> 30) & 1) != 0; // 1 bit (30)
+  let key_is_down = ((lparam >> 31) & 1) == 0; // 1 bit (31)
+
+  // dbg!(key_code, is_extended, key_was_down, key_is_down);
+
+  let repeat_key_down =
+    key_was_down && (message == WM_KEYDOWN || message == WM_SYSKEYDOWN);
+  let repeat_key_up =
+    !key_was_down && (message == WM_KEYUP || message == WM_SYSKEYUP);
+
+  if repeat_key_up {
+    panic!("Got repeated key up event, which should never happen.");
+  } else if repeat_key_down {
+    // ignore
+  } else if key_code == VK_RIGHT {
+    println!("RIGHT");
+  } else if key_code == VK_LEFT {
+    println!("LEFT");
+  } else if key_code == VK_UP {
+    println!("UP");
+  } else if key_code == VK_DOWN {
+    println!("DOWN");
+  } else if key_code == VK_SPACE {
+    println!("SPACE");
+  } else if key_code == VK_ESCAPE {
+    SHOULD_RUN.store(false, SeqCst);
+  } else {
+    println!("WARNING: Got unknown keyboard event");
   }
 }
