@@ -23,6 +23,18 @@ use std::time::Instant;
 static SHOULD_RUN: AtomicBool = AtomicBool::new(true);
 static WINDOW_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
+static MONITOR_REFRESH_RATE: AtomicU32 = AtomicU32::new(60);
+unsafe fn update_monitor_refresh_rate() {
+  let mut devmode = DEVMODEA::default();
+  devmode.dmSize = mem::size_of_val(&devmode) as _;
+  let result =
+    EnumDisplaySettingsA(None, ENUM_CURRENT_SETTINGS, &mut devmode);
+  let refresh_rate = devmode.dmDisplayFrequency;
+  if result.0 != 0 && refresh_rate > 1 {
+    MONITOR_REFRESH_RATE.store(refresh_rate, SeqCst);
+  }
+}
+
 static FRAMEBUFFERS: [FrameBuffer; 2] =
   [FrameBuffer::new(), FrameBuffer::new()];
 struct FrameBuffer {
@@ -106,14 +118,34 @@ pub fn colorref_to_rgb(color: COLORREF) -> (u8, u8, u8) {
 }
 
 static GAMESTATE: GameState = GameState::new();
+
+#[derive(Debug)]
 struct GameState {
   pub rgb: AtomicUsize,
   pub x: AtomicUsize,
+
+  pub action_up: AtomicBool,
+  pub action_down: AtomicBool,
+  pub action_left: AtomicBool,
+  pub action_right: AtomicBool,
+  pub action_space: AtomicBool,
 }
 impl GameState {
   pub const fn new() -> Self {
-    Self { rgb: AtomicUsize::new(0), x: AtomicUsize::new(0) }
+    Self {
+      rgb: AtomicUsize::new(0),
+      x: AtomicUsize::new(0),
+      action_up: AtomicBool::new(false),
+      action_down: AtomicBool::new(false),
+      action_left: AtomicBool::new(false),
+      action_right: AtomicBool::new(false),
+      action_space: AtomicBool::new(false),
+    }
   }
+}
+
+struct KeyState {
+  pub ended_down: AtomicBool,
 }
 
 fn update() {
@@ -214,8 +246,8 @@ fn main() -> Result<()> {
           HWND(0),
           100,
           100,
-          400,
-          400,
+          800,
+          800,
           SET_WINDOW_POS_FLAGS(0),
         )
         .unwrap();
@@ -230,7 +262,7 @@ fn main() -> Result<()> {
       let mut format_desc = PIXELFORMATDESCRIPTOR::default();
       format_desc.nSize = mem::size_of::<PIXELFORMATDESCRIPTOR>() as _;
       format_desc.nVersion = 1;
-      format_desc.dwFlags = PFD_DRAW_TO_WINDOW; // | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+      format_desc.dwFlags = PFD_DRAW_TO_WINDOW; // PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
       format_desc.iPixelType = PFD_TYPE_RGBA;
       format_desc.cColorBits = 32;
       format_desc.cDepthBits = 16; // 16, 24 or 32?
@@ -276,6 +308,8 @@ fn main() -> Result<()> {
         (client_rect.right - client_rect.left) as _,
         (client_rect.bottom - client_rect.top) as _,
       );
+
+      update_monitor_refresh_rate();
 
       // let _ = EnableWindow(hwnd, true);
       let _ = ShowWindow(hwnd, SW_SHOW);
@@ -402,7 +436,7 @@ unsafe fn draw(wait_for_vsync: bool) {
   assert!(result != 0);
 
   if wait_for_vsync {
-    // SwapBuffers().unwrap();
+    // SwapBuffers(hdc).unwrap();
     DwmFlush().unwrap();
   }
 
@@ -432,7 +466,8 @@ extern "system" fn window_proc(
       SHOULD_RUN.store(false, Ordering::SeqCst);
       return LRESULT(0);
     } else if message == WM_ERASEBKGND {
-      return LRESULT(1); // tell Windows we processed this
+      return LRESULT(1); // ignore it to avoid flicker
+                         //
     } else if message == WM_QUIT {
       panic!("Got WM_QUIT. Windows should never send this message");
     } else if message == WM_SIZE {
@@ -440,6 +475,19 @@ extern "system" fn window_proc(
       let height = (lparam.0 >> 16) & 0xFFFF;
       TARGET_WINDOW_SIZE.store(width as _, height as _);
       return LRESULT(0);
+    } else if message == WM_DISPLAYCHANGE {
+      let _image_depth = wparam;
+      let _horizontal_resolution = lparam.0 & 0xFFFF;
+      let _vertical_resolution = (lparam.0 >> 16) & 0xFFFF;
+
+      let mut client_rect = RECT::default();
+      GetClientRect(window, &mut client_rect).unwrap();
+      TARGET_WINDOW_SIZE.store(
+        (client_rect.right - client_rect.left) as _,
+        (client_rect.bottom - client_rect.top) as _,
+      );
+
+      update_monitor_refresh_rate();
     }
     DefWindowProcA(window, message, wparam, lparam)
   }
@@ -479,20 +527,36 @@ fn handle_keyboard_message(
   if repeat_key_up {
     panic!("Got repeated key up event, which should never happen.");
   } else if repeat_key_down {
-    // ignore
-  } else if key_code == VK_RIGHT {
-    println!("RIGHT");
-  } else if key_code == VK_LEFT {
-    println!("LEFT");
-  } else if key_code == VK_UP {
-    println!("UP");
-  } else if key_code == VK_DOWN {
-    println!("DOWN");
-  } else if key_code == VK_SPACE {
-    println!("SPACE");
-  } else if key_code == VK_ESCAPE {
-    SHOULD_RUN.store(false, SeqCst);
+    // ignore reapeated presses
+  } else if message == WM_KEYDOWN || message == WM_KEYUP {
+    let mut state = true;
+    if message == WM_KEYUP {
+      state = false;
+    }
+
+    if key_code == VK_RIGHT {
+      let prev = GAMESTATE.action_right.swap(state, SeqCst);
+      assert!(prev != state);
+    } else if key_code == VK_LEFT {
+      let prev = GAMESTATE.action_left.swap(state, SeqCst);
+      assert!(prev != state);
+    } else if key_code == VK_UP {
+      let prev = GAMESTATE.action_up.swap(state, SeqCst);
+      assert!(prev != state);
+    } else if key_code == VK_DOWN {
+      let prev = GAMESTATE.action_down.swap(state, SeqCst);
+      assert!(prev != state);
+    } else if key_code == VK_SPACE {
+      let prev = GAMESTATE.action_space.swap(state, SeqCst);
+      assert!(prev != state);
+    } else if key_code == VK_ESCAPE {
+      SHOULD_RUN.store(false, SeqCst);
+    } else {
+      // println!("WARNING: Got unknown WM_KEYDOWN event");
+    }
+
+    dbg!(&GAMESTATE);
   } else {
-    println!("WARNING: Got unknown keyboard event");
+    // println!("WARNING: Got unhandled {message:?} message event");
   }
 }
