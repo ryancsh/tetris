@@ -20,6 +20,11 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+/*
+mod draw;
+use draw::*;
+*/
+
 static SHOULD_RUN: AtomicBool = AtomicBool::new(true);
 static WINDOW_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
@@ -35,13 +40,61 @@ unsafe fn update_monitor_refresh_rate() {
   }
 }
 
-static FRAMEBUFFERS: [FrameBuffer; 2] =
+#[derive(Debug, Clone, Copy)]
+pub struct Color {
+  pub r: f32,   // 0 to 1
+  pub g: f32,
+  pub b: f32,
+  pub a: f32,
+}
+impl Color {
+  pub const fn new() -> Self { Self{r: 0.0, g: 0.0, b: 0.0, a: 1.0} }
+
+  pub fn rgb(r: f32, g: f32, b: f32) -> Self {
+    Color::rgba(r, g, b, 1.0)
+  }
+
+  pub fn rgba(r: f32, g: f32, b: f32, a: f32) -> Self
+  {
+    debug_assert!(r >= 0.0 && r <= 1.0);
+    debug_assert!(g >= 0.0 && g <= 1.0);
+    debug_assert!(b >= 0.0 && b <= 1.0);
+    debug_assert!(a >= 0.0 && a <= 1.0);
+    Color { r, g, b, a }
+  }
+}
+impl Default for Color {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+impl From<COLORREF> for Color {
+  fn from(c: COLORREF) -> Self {
+    let r = (((c.0 >> 16) & 0xFF) as f32) / (u8::MAX as f32);
+    let g = (((c.0 >> 8) & 0xFF) as f32) / (u8::MAX as f32);
+    let b = ((c.0 & 0xFF) as f32) / (u8::MAX as f32);
+    Self::rgb(r as _, g as _, b as _)
+  }
+}
+impl From<Color> for COLORREF {
+  fn from(c: Color) -> Self {
+    let r = ((c.r * (u8::MAX as f32)) as u32) << 16;
+    let g = ((c.g * (u8::MAX as f32)) as u32) << 8;
+    let b = (c.b * (u8::MAX as f32)) as u32;
+    let result = b | g | r;
+    COLORREF(result)
+  }
+}
+
+static BACKBUFFER: FrameBuffer<Color> = FrameBuffer::new();
+static FRONTBUFFERS: [FrameBuffer<COLORREF>; 2] =
   [FrameBuffer::new(), FrameBuffer::new()];
-struct FrameBuffer {
-  pub pixels: Mutex<Vec<COLORREF>>,
+
+struct FrameBuffer<T> where T: Copy + Default {
+  pub pixels: Mutex<Vec<T>>,
   pub window_size: AtomicWindowSize,
 }
-impl FrameBuffer {
+impl<T> FrameBuffer<T> where T: Copy+Default {
   pub const fn new() -> Self {
     Self {
       pixels: Mutex::new(Vec::new()),
@@ -57,7 +110,7 @@ impl FrameBuffer {
   pub fn resize(&self, width: usize, height: usize) {
     let (self_width, self_height) = self.window_size.load();
     if width * height > self_width * self_height {
-      self.pixels.lock().unwrap().resize(width * height, COLORREF(0));
+      self.pixels.lock().unwrap().resize(width * height, T::default());
     }
     self.window_size.store(width as _, height as _);
   }
@@ -68,7 +121,7 @@ static SWAP_BUFFERS: AtomicBool = AtomicBool::new(false);
 fn front_buffer_index() -> usize {
   FRONT_BUFFER_INDEX.load(SeqCst)
 }
-fn back_buffer_index() -> usize {
+fn spare_buffer_index() -> usize {
   FRONT_BUFFER_INDEX.load(SeqCst) ^ 1
 }
 fn perform_buffer_swap() {
@@ -102,26 +155,11 @@ impl AtomicWindowSize {
   }
 }
 
-pub fn rgb_to_colorref(r: u8, g: u8, b: u8) -> COLORREF {
-  let r = (r as u32) << 16;
-  let g = (g as u32) << 8;
-  let b = b as u32;
-  let result = b | g | r;
-  COLORREF(result)
-}
-pub fn colorref_to_rgb(color: COLORREF) -> (u8, u8, u8) {
-  let c = color.0;
-  let r = ((c >> 16) & 0xFF) as u8;
-  let g = ((c >> 8) & 0xFF) as u8;
-  let b = (c & 0xFF) as u8;
-  (r, g, b)
-}
-
 static GAMESTATE: GameState = GameState::new();
 
 #[derive(Debug)]
 struct GameState {
-  pub rgb: AtomicUsize,
+  pub rgb: Mutex<Color>,
   pub x: AtomicUsize,
 
   pub action_up: AtomicBool,
@@ -133,7 +171,7 @@ struct GameState {
 impl GameState {
   pub const fn new() -> Self {
     Self {
-      rgb: AtomicUsize::new(0),
+      rgb: Mutex::new(Color::new()),
       x: AtomicUsize::new(0),
       action_up: AtomicBool::new(false),
       action_down: AtomicBool::new(false),
@@ -144,17 +182,26 @@ impl GameState {
   }
 }
 
+/*
 struct KeyState {
   pub ended_down: AtomicBool,
 }
+*/
 
 fn update() {
-  let rgb = GAMESTATE.rgb.load(SeqCst);
-  let r = ((rgb & 0xFF_0000) + (2 << 16)) & 0xFF_0000;
-  let g = ((rgb & 0x00_FF00) + (3 << 8)) & 0x00_FF00;
-  let b = ((rgb & 0x00_00FF) + 5) & 0xFF;
-  let new_rgb = r | g | b;
-  GAMESTATE.rgb.compare_exchange(rgb, new_rgb, SeqCst, SeqCst).unwrap();
+  let mut rgb = GAMESTATE.rgb.try_lock().unwrap();
+  fn increment_color(c: f32, amount_255: f32) -> f32 {
+    let amount = (amount_255 / (u8::MAX as f32)).clamp(0.0, 1.0);
+    let mut c = c + amount;
+    if c > 1.0 {
+      c -= 1.0;
+    }
+    c
+  }
+
+  rgb.r = increment_color(rgb.r, 2.0);
+  rgb.g = increment_color(rgb.g, 3.0);
+  rgb.b = increment_color(rgb.b, 5.0);
 
   let _ = GAMESTATE.x.fetch_add(1, SeqCst);
 }
@@ -165,38 +212,53 @@ fn render() {
     return;
   }
 
+  let color;
+  {
+    let mutex = GAMESTATE.rgb.try_lock().unwrap();
+    color = *mutex;
+  }
+
+  /*
   let rgb = GAMESTATE.rgb.load(SeqCst);
   let r = (rgb >> 16) & 0xFF;
   let g = (rgb >> 8) & 0xFF;
   let b = rgb & 0xFF;
-
-  let back_buffer = &FRAMEBUFFERS[back_buffer_index()];
+  */
 
   let (win_width, win_height) = TARGET_WINDOW_SIZE.load();
-  back_buffer.resize(win_width, win_height);
+  BACKBUFFER.resize(win_width, win_height);
 
-  let mut pixels = back_buffer.pixels.try_lock().unwrap();
-  let black = rgb_to_colorref(0, 0, 0);
+  let mut back_pixels = BACKBUFFER.pixels.try_lock().unwrap();
+  let black = Color::rgb(0.0, 0.0, 0.0);
+
+  // clear buffer
   for i in 0..win_width * win_height {
-    pixels[i] = black;
+    back_pixels[i] = black;
   }
 
-  let color = rgb_to_colorref(r as _, g as _, b as _);
+  // draw square
   for y in 1..win_height / 4 {
     for x in 1..win_width / 4 {
-      pixels[y * win_width + x] = color;
+      back_pixels[y * win_width + x] = color;
     }
   }
 
   let game_x = GAMESTATE.x.load(SeqCst);
-  pixels[((win_height * 3 / 4) * win_width) + game_x] =
-    rgb_to_colorref(0, 0, 0xFF);
-  pixels[((win_height * 3 / 4) * win_width) + game_x + 1] =
-    rgb_to_colorref(0, 0, 0xFF);
-  pixels[((win_height * 3 / 4) * win_width) + game_x + 2] =
-    rgb_to_colorref(0, 0xFF, 0);
-  pixels[((win_height * 3 / 4) * win_width) + game_x + 3] =
-    rgb_to_colorref(0xFF, 0, 0);
+  back_pixels[((win_height * 3 / 4) * win_width) + game_x] = Color::rgb(0.0, 0.0, 1.0);
+  back_pixels[((win_height * 3 / 4) * win_width) + game_x + 1] = Color::rgb(0.0, 0.0, 1.0);
+  back_pixels[((win_height * 3 / 4) * win_width) + game_x + 2] = Color::rgb(0.0, 1.0, 0.0);
+  back_pixels[((win_height * 3 / 4) * win_width) + game_x + 3] = Color::rgb(1.0, 0.0, 0.0);
+
+  let buffer = &FRONTBUFFERS[spare_buffer_index()];
+  buffer.resize(win_width, win_height);
+  let mut front_pixels = buffer.pixels.try_lock().unwrap();
+
+  for i in 0.. win_width * win_height {
+    front_pixels[i] = back_pixels[i].into();
+  }
+
+  drop(back_pixels);
+  drop(front_pixels);
 
   SWAP_BUFFERS.store(true, SeqCst);
 }
@@ -348,14 +410,14 @@ fn main() -> Result<()> {
       draw(true);
 
       // thread::sleep(Duration::from_millis(1));
-      if false {
+      if true {
         let now = Instant::now();
         let frame_time = now.duration_since(last_instant);
         println!(
           "Frame {} ms, front: {}, back: {}",
           frame_time.as_secs_f32() * 1000.0,
           front_buffer_index(),
-          back_buffer_index(),
+          spare_buffer_index(),
         );
         last_instant = now;
       }
@@ -391,7 +453,7 @@ unsafe fn draw(wait_for_vsync: bool) {
 
   perform_buffer_swap();
 
-  let buffer = &FRAMEBUFFERS[front_buffer_index()];
+  let buffer = &FRONTBUFFERS[front_buffer_index()];
   let (img_width, img_height) = buffer.window_size.load();
   let (win_width, win_height) = TARGET_WINDOW_SIZE.load();
 
