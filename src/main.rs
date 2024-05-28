@@ -39,7 +39,7 @@ unsafe fn update_monitor_refresh_rate() {
   if result.0 != 0 && refresh_rate > 1 {
     let refresh_nanos = 1_000_000_000 / refresh_rate as u64;
     MONITOR_REFRESH_NANOS.store(refresh_nanos, SeqCst);
-    RENDER_NANOS.store(0, SeqCst);
+    RENDER_NANOS.try_lock().unwrap().put_all(refresh_nanos);
   }
 }
 
@@ -134,9 +134,61 @@ fn perform_buffer_swap() {
   }
 }
 
-static RENDER_NANOS: AtomicU64 = AtomicU64::new(0);
-static RENDER_SIZE: Atomic2dSize = Atomic2dSize::new();
 
+static WAIT_FOR_VSYNC_NANOS: AtomicU64 = AtomicU64::new(0);
+
+static RENDER_NANOS: Mutex<RenderNanos> = Mutex::new(RenderNanos::new());
+struct RenderNanos {
+  data: [u64; 100],
+  next_index: usize,
+  total: u64,
+}
+impl RenderNanos {
+  pub const fn new() -> Self {
+    Self {
+      data: [0; 100],
+      next_index: 0,
+      total: 0,
+    }
+  }
+
+  pub fn put(&mut self, nano: u64) {
+    let prev = self.data[self.next_index];
+    self.data[self.next_index] = nano;
+    self.next_index = (self.next_index + 1) % self.data.len();
+    self.total = self.total + nano - prev;
+  }
+
+  pub fn put_all(&mut self, nano: u64) {
+    for i in 0..self.data.len() {
+      self.data[i] = nano;
+    }
+    self.next_index = 0;
+    self.total = nano * self.data.len() as u64;
+  }
+
+  pub fn get_last(&self) -> u64 {
+    let mut index = self.next_index;
+    if index == 0 {
+      index = self.data.len();
+    }
+    index -= 1;
+    self.data[index]
+  }
+
+  pub fn get_avg(&self) -> u64 {
+    self.total / self.data.len() as u64
+  }
+}
+
+unsafe fn update_timers(frame_start: Instant, draw_end: Instant, wait_end: Instant) {
+  let vsync = wait_end.duration_since(draw_end).as_nanos();
+  WAIT_FOR_VSYNC_NANOS.store(vsync.try_into().unwrap(), SeqCst);
+  let render = draw_end.duration_since(frame_start).as_nanos();
+  RENDER_NANOS.try_lock().unwrap().put(render.try_into().unwrap());
+}
+
+static RENDER_SIZE: Atomic2dSize = Atomic2dSize::new();
 static WINDOW_SIZE: Atomic2dSize = Atomic2dSize::new();
 struct Atomic2dSize {
   inner: AtomicU64,
@@ -164,7 +216,7 @@ static GAMESTATE: GameState = GameState::new();
 #[derive(Debug)]
 struct GameState {
   pub rgb: Mutex<Color>,
-  pub x: AtomicUsize,
+  pub x: AtomicU64,
 
   pub action_up: AtomicBool,
   pub action_down: AtomicBool,
@@ -174,9 +226,14 @@ struct GameState {
 }
 impl GameState {
   pub const fn new() -> Self {
+    let x = unsafe {
+      let x = 0.0_f64;
+      let x: u64 = mem::transmute(x);
+      x
+    };
     Self {
       rgb: Mutex::new(Color::new()),
-      x: AtomicUsize::new(0),
+      x: AtomicU64::new(x),
       action_up: AtomicBool::new(false),
       action_down: AtomicBool::new(false),
       action_left: AtomicBool::new(false),
@@ -192,7 +249,7 @@ struct KeyState {
 }
 */
 
-fn update() {
+unsafe fn update() {
   let mut rgb = GAMESTATE.rgb.try_lock().unwrap();
   fn increment_color(c: f32, amount_255: f32) -> f32 {
     let amount = (amount_255 / (u8::MAX as f32)).clamp(0.0, 1.0);
@@ -207,12 +264,17 @@ fn update() {
   rgb.g = increment_color(rgb.g, 3.0);
   rgb.b = increment_color(rgb.b, 5.0);
 
-  let _ = GAMESTATE.x.fetch_add(1, SeqCst);
+  let x = GAMESTATE.x.load(SeqCst);
+  let mut x_f64: f64 = mem::transmute(x);
+  x_f64 += 0.001;
+  while x_f64 >= 1.0 {
+    x_f64 -= 1.0;
+  }
+  let x: u64 = mem::transmute(x_f64);
+  GAMESTATE.x.store(x, SeqCst);
 }
 
-fn render() {
-  let now = Instant::now();
-
+unsafe fn render() {
   let ready = SWAP_BUFFERS.load(SeqCst);
   if ready {
     return;
@@ -222,34 +284,56 @@ fn render() {
   {
     let mutex = GAMESTATE.rgb.try_lock().unwrap();
     color = *mutex;
+    // drop mutex
   }
 
-  /*
-  let rgb = GAMESTATE.rgb.load(SeqCst);
-  let r = (rgb >> 16) & 0xFF;
-  let g = (rgb >> 8) & 0xFF;
-  let b = rgb & 0xFF;
-  */
-
-  let (window_width, window_height) = WINDOW_SIZE.load();
+  let (win_width, win_height) = WINDOW_SIZE.load();
   let (orig_render_width, orig_render_height) = RENDER_SIZE.load();
   let mut render_width = orig_render_width;
   let mut render_height = orig_render_height;
 
-  let render_nanos = RENDER_NANOS.load(SeqCst);
-  let refresh_nanos = MONITOR_REFRESH_NANOS.load(SeqCst);
+  let (render_last, render_avg) = {
+    let mutex = RENDER_NANOS.try_lock().unwrap();
+    (mutex.get_last(), mutex.get_avg())
+  };
+  let refresh_ns = MONITOR_REFRESH_NANOS.load(SeqCst);
 
-  if render_nanos >= refresh_nanos {
-    render_width = (render_width * 11 / 16).max(1);
-    render_height = (render_height * 11 / 16).max(1);
-  } else if render_nanos < (refresh_nanos / 4) {
-    render_width = (render_width * 11 / 8).min(window_width);
-    render_height = (render_height * 11 / 8).min(window_height);
+  let ms = 1_000_000;
+
+  if render_last >= refresh_ns * 5 / 4 {
+    // missed a frame
+    if win_width >= win_height {
+      render_height = (render_height * 11 / 16).max(1);
+      render_width = render_height * win_width / win_height;
+    } else {
+      render_width = (render_width * 11 / 16).max(1);
+      render_height = render_width * win_height / win_width;
+    }
+  } else if render_avg >= refresh_ns * 3 / 4 {
+    // getting close to missing a frame, pull back on resolution
+    if win_width >= win_height {
+      render_height = (render_height - 1).max(1);
+      render_width = render_height * win_width / win_height;
+    } else {
+      render_width = (render_width - 1).max(1);
+      render_height = render_width * win_height / win_width;
+    }
+  } else if render_avg <= refresh_ns / 2 {
+    // have spare time, slowly up render resolution
+    if win_width >= win_height {
+      render_height = (render_height + 1).min(win_height);
+      render_width = render_height * win_width / win_height;
+    } else {
+      render_width = (render_width + 1).min(win_width);
+      render_height = render_width * win_height / win_width;
+    }
+  } else {
+    // render size is okay
   }
 
-  let update_render_size = render_width != orig_render_width
+  let render_size_changed = render_width != orig_render_width
     || render_height != orig_render_height;
-  if update_render_size {
+  if render_size_changed {
     RENDER_SIZE.store(render_width, render_height);
   }
 
@@ -271,6 +355,8 @@ fn render() {
   }
 
   let game_x = GAMESTATE.x.load(SeqCst);
+  let game_x: f64 = mem::transmute(game_x);
+  let game_x = (game_x * render_width as f64).floor() as usize;
   back_pixels[((render_height * 3 / 4) * render_width) + game_x] =
     Color::rgb(0.0, 0.0, 1.0);
   back_pixels[((render_height * 3 / 4) * render_width) + game_x + 1] =
@@ -292,9 +378,6 @@ fn render() {
   drop(front_pixels);
 
   SWAP_BUFFERS.store(true, SeqCst);
-
-  let elapsed_nanos = now.elapsed().as_nanos().try_into().unwrap();
-  RENDER_NANOS.store(elapsed_nanos, SeqCst);
 }
 
 fn main() -> Result<()> {
@@ -314,7 +397,7 @@ fn main() -> Result<()> {
 
       let avg_frame_time_nanos = elapsed / flush_count * 1_000_000_000.0;
       let diff_nanos = (avg_frame_time_nanos - refresh_nanos).abs();
-      assert!(diff_nanos < 10_000.0, "{diff_nanos}");
+      assert!(diff_nanos < 1_000_000.0, "{diff_nanos} ns diff from vsync");
     }
 
     // start creating window
@@ -432,8 +515,15 @@ fn main() -> Result<()> {
     }
 
     // draw before first update
-    render();
-    draw(true);
+    {
+      let render_start = Instant::now();
+      render();
+      draw();
+      let draw_end = Instant::now();
+      wait_for_vsync();
+      let wait_end = Instant::now();
+      update_timers(render_start, draw_end, wait_end);
+    }
 
     let mut last_instant = Instant::now();
     let mut message = MSG::default();
@@ -456,18 +546,26 @@ fn main() -> Result<()> {
         }
       }
 
-      update(); // TODO: make this use dt
-      render();
-      draw(true);
+      {
+        update(); // TODO: make this use dt
+        let render_start = Instant::now();
+        render();
+        draw();
+        let draw_end = Instant::now();
+        wait_for_vsync();
+        let wait_end = Instant::now();
+        update_timers(render_start, draw_end, wait_end);
+      }
 
       // thread::sleep(Duration::from_millis(1));
-      if false {
+      if true {
         let now = Instant::now();
         let frame_time = now.duration_since(last_instant);
         let (render_w, render_h) = RENDER_SIZE.load();
-        let render_ms = RENDER_NANOS.load(SeqCst) as f64 / 1_000_000.0;
+        let render_ms = RENDER_NANOS.try_lock().unwrap().get_last() as f64 / 1_000_000.0;
+        let wait_ms = WAIT_FOR_VSYNC_NANOS.load(SeqCst) as f64 / 1_000_000.0;
         println!(
-          "Frame {} ms, front: {}, back: {}, render_size: {} x {} in {render_ms} ms",
+          "Frame {} ms, front: {}, back: {}, render: {} x {} in {render_ms} ms, vsyncwait: {wait_ms} ms",
           frame_time.as_secs_f32() * 1000.0,
           front_buffer_index(),
           spare_buffer_index(),
@@ -492,7 +590,11 @@ fn main() -> Result<()> {
   }
 }
 
-unsafe fn draw(wait_for_vsync: bool) {
+unsafe fn wait_for_vsync() {
+  DwmFlush().unwrap();
+}
+
+unsafe fn draw() {
   let hwnd = HWND(WINDOW_HANDLE.load(SeqCst));
   if hwnd.0 == 0 {
     println!("Got NULL hwnd. Skipping call to draw()");
@@ -551,11 +653,6 @@ unsafe fn draw(wait_for_vsync: bool) {
   );
   assert!(result != 0);
 
-  if wait_for_vsync {
-    // SwapBuffers(hdc).unwrap();
-    DwmFlush().unwrap();
-  }
-
   ReleaseDC(hwnd, hdc);
 }
 
@@ -569,7 +666,7 @@ extern "system" fn window_proc(
     if message == WM_PAINT {
       let mut paint = PAINTSTRUCT::default();
       BeginPaint(window, &mut paint);
-      draw(false);
+      draw();
       let _ = EndPaint(window, &paint);
       return LRESULT(0);
     } else if message == WM_KEYDOWN
