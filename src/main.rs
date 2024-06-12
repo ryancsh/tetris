@@ -13,6 +13,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use std::mem;
 use std::ptr;
+use std::sync;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::*;
 use std::sync::Mutex;
@@ -112,7 +113,13 @@ where
   pub fn resize(&self, width: usize, height: usize) {
     let (self_width, self_height) = self.size.load();
     if width * height > self_width * self_height {
-      self.pixels.lock().unwrap().resize(width * height, T::default());
+      let mut pixels = self.pixels.try_lock().unwrap();
+      if width * height > pixels.capacity(){ 
+        // clear here to avoid copy when reallocating
+        pixels.clear();
+      }
+      let new_val = T::default();
+      pixels.resize(width * height, new_val);
     }
     self.size.store(width as _, height as _);
   }
@@ -212,11 +219,46 @@ impl Atomic2dSize {
   }
 }
 
+#[derive(Debug)]
+struct AtomicF64 {
+  inner: AtomicU64
+}
+impl AtomicF64 {
+  pub const fn new(value: f64) -> Self {
+    unsafe {
+      let inner: u64 = mem::transmute(value);
+      Self {inner: AtomicU64::new(inner)}
+    }
+  }
+
+  pub fn load(&self, order: sync::atomic::Ordering) -> f64 {
+    unsafe {
+      mem::transmute(self.inner.load(order))
+    }
+  }
+
+  pub fn store(&self, val: f64, order: sync::atomic::Ordering) {
+    unsafe {
+      let val: u64 = mem::transmute(val);
+      self.inner.store(val, order)
+    }
+  }
+
+  pub fn swap(&self, val: f64, order: Ordering) -> f64 {
+    unsafe {
+      let val: u64 = mem::transmute(val);
+      mem::transmute(self.inner.swap(val, order))
+    }
+  }
+}
+
 static GAMESTATE: GameState = GameState::new();
 #[derive(Debug)]
 struct GameState {
   pub rgb: Mutex<Color>,
-  pub x: AtomicU64,
+  pub x: AtomicF64,
+
+  pub ship_x: AtomicF64,
 
   pub action_up: AtomicBool,
   pub action_down: AtomicBool,
@@ -226,14 +268,12 @@ struct GameState {
 }
 impl GameState {
   pub const fn new() -> Self {
-    let x = unsafe {
-      let x = 0.0_f64;
-      let x: u64 = mem::transmute(x);
-      x
-    };
     Self {
       rgb: Mutex::new(Color::new()),
-      x: AtomicU64::new(x),
+      x: AtomicF64::new(0.0),
+
+      ship_x: AtomicF64::new(0.5),
+
       action_up: AtomicBool::new(false),
       action_down: AtomicBool::new(false),
       action_left: AtomicBool::new(false),
@@ -264,14 +304,23 @@ unsafe fn update() {
   rgb.g = increment_color(rgb.g, 3.0);
   rgb.b = increment_color(rgb.b, 5.0);
 
-  let x = GAMESTATE.x.load(SeqCst);
-  let mut x_f64: f64 = mem::transmute(x);
-  x_f64 += 0.001;
-  while x_f64 >= 1.0 {
-    x_f64 -= 1.0;
+  let mut x = GAMESTATE.x.load(SeqCst);
+  x += 0.001;
+  while x >= 1.0 {
+    x -= 1.0;
   }
-  let x: u64 = mem::transmute(x_f64);
   GAMESTATE.x.store(x, SeqCst);
+
+  let ship_x = GAMESTATE.ship_x.load(SeqCst);
+  let mut d_ship_x = 0.0;
+  if GAMESTATE.action_left.load(SeqCst) {
+    d_ship_x -= 0.001;
+  }
+  if GAMESTATE.action_right.load(SeqCst) {
+    d_ship_x += 0.001;
+  }
+  let old_ship_x = GAMESTATE.ship_x.swap(ship_x + d_ship_x, SeqCst);
+  assert!(ship_x == old_ship_x);
 }
 
 unsafe fn render() {
@@ -301,7 +350,7 @@ unsafe fn render() {
   let ms = 1_000_000;
 
   if render_last >= refresh_ns * 5 / 4 {
-    // missed a frame
+    // missed a frame, aggressively reduce render resolution
     if win_width >= win_height {
       render_height = (render_height * 11 / 16).max(1);
       render_width = render_height * win_width / win_height;
@@ -310,7 +359,7 @@ unsafe fn render() {
       render_height = render_width * win_height / win_width;
     }
   } else if render_avg >= refresh_ns * 3 / 4 {
-    // getting close to missing a frame, pull back on resolution
+    // getting close to missing a frame, slightly reduce render resolution
     if win_width >= win_height {
       render_height = (render_height - 1).max(1);
       render_width = render_height * win_width / win_height;
@@ -328,7 +377,7 @@ unsafe fn render() {
       render_height = render_width * win_height / win_width;
     }
   } else {
-    // render size is okay
+    // render resolution is okay
   }
 
   let render_size_changed = render_width != orig_render_width
@@ -336,13 +385,12 @@ unsafe fn render() {
   if render_size_changed {
     RENDER_SIZE.store(render_width, render_height);
   }
-
   BACKBUFFER.resize(render_width, render_height);
 
   let mut back_pixels = BACKBUFFER.pixels.try_lock().unwrap();
-  let black = Color::rgb(0.0, 0.0, 0.0);
 
   // clear buffer
+  let black = Color::rgb(0.0, 0.0, 0.0);
   for i in 0..render_width * render_height {
     back_pixels[i] = black;
   }
@@ -354,18 +402,39 @@ unsafe fn render() {
     }
   }
 
-  let game_x = GAMESTATE.x.load(SeqCst);
-  let game_x: f64 = mem::transmute(game_x);
-  let game_x = (game_x * render_width as f64).floor() as usize;
-  back_pixels[((render_height * 3 / 4) * render_width) + game_x] =
-    Color::rgb(0.0, 0.0, 1.0);
-  back_pixels[((render_height * 3 / 4) * render_width) + game_x + 1] =
-    Color::rgb(0.0, 0.0, 1.0);
-  back_pixels[((render_height * 3 / 4) * render_width) + game_x + 2] =
-    Color::rgb(0.0, 1.0, 0.0);
-  back_pixels[((render_height * 3 / 4) * render_width) + game_x + 3] =
-    Color::rgb(1.0, 0.0, 0.0);
+  {
+    fn clamp_scale_convert_f64(float: f64, scale_to: usize) -> usize {
+      let result = float.clamp(0.0, 1.0) * scale_to as f64;
+      (result as usize).clamp(0, scale_to)
+    }
 
+    let game_x = GAMESTATE.x.load(SeqCst);
+    let game_x: f64 = mem::transmute(game_x);
+    let game_x = clamp_scale_convert_f64(game_x, render_width);
+    back_pixels[((render_height * 3 / 4) * render_width) + game_x] =
+      Color::rgb(0.0, 0.0, 1.0);
+    back_pixels[((render_height * 3 / 4) * render_width) + game_x + 1] =
+      Color::rgb(0.0, 0.0, 1.0);
+    back_pixels[((render_height * 3 / 4) * render_width) + game_x + 2] =
+      Color::rgb(0.0, 1.0, 0.0);
+    back_pixels[((render_height * 3 / 4) * render_width) + game_x + 3] =
+      Color::rgb(1.0, 0.0, 0.0);
+
+    let ship_x = GAMESTATE.ship_x.load(SeqCst);
+    let left_x = clamp_scale_convert_f64(ship_x - 0.01, render_width);
+    let right_x = clamp_scale_convert_f64(ship_x + 0.01, render_width);
+    let bottom_y = clamp_scale_convert_f64(0.04, render_height);
+    let top_y = clamp_scale_convert_f64(0.06, render_height);
+
+    let white = Color::rgb(1.0, 1.0, 1.0);
+    for y in bottom_y..=top_y {
+      for x in left_x..=right_x {
+        back_pixels[y * render_width + x] = white;
+      }
+    }
+  }
+
+  // convert our bitmap format into what platform wants
   let buffer = &FRONTBUFFERS[spare_buffer_index()];
   buffer.resize(render_width, render_height);
   let mut front_pixels = buffer.pixels.try_lock().unwrap();
@@ -374,6 +443,7 @@ unsafe fn render() {
     front_pixels[i] = back_pixels[i].into();
   }
 
+  // drop mutexes
   drop(back_pixels);
   drop(front_pixels);
 
